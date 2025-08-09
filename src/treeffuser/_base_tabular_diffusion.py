@@ -291,6 +291,7 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
         n_steps: int = 50,
         seed=None,
         verbose: bool = False,
+        method: str = "euler"
     ) -> Float[ndarray, "n_samples batch y_dim"]:
         """
         Sample responses from the diffusion model conditional on the given input data `X`.
@@ -309,6 +310,11 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
             Seed for the random number generator of the sampling. Default is None.
         verbose : bool, optional
             Show a progress bar indicating the number of samples drawn. Default is False.
+        method : str, optional
+            The numerical integration method to use for the SDE solver.
+            Defaults to "euler", which uses a NumPy-based Euler-Maruyama solver on the CPU.
+            Set to "torchsde" to use the GPU-accelerated backend, which requires the
+            model to have been initialized with `backend="torch"`.
 
         Returns
         -------
@@ -331,7 +337,7 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
         X, _, _ = self._preprocess_and_validate_data(X=X, validate_y=False)
 
         y_samples = self._sample_without_validation(
-            X, n_samples, n_parallel=n_parallel, n_steps=n_steps, seed=seed, verbose=verbose
+            X, n_samples, n_parallel=n_parallel, n_steps=n_steps, seed=seed, verbose=verbose, method=method
         )
 
         # Ensure output aligns with original shape provided by user
@@ -348,6 +354,7 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
         n_steps: int = 100,
         seed=None,
         verbose: bool = False,
+        method: str = "euler"
     ) -> Float[ndarray, "n_samples batch y_dim"]:
         """
         Sampling method that preserves shape conventions.
@@ -371,10 +378,15 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
                 # Reuse the same batch of x as much as possible
                 x_batched = np.tile(x_transformed, [batch_size_samples, 1])
 
-            def _score_fn(y, t):
-                return self.score_model.score(y=y, X=x_batched, t=t)  # noqa: B023
-                # B023 highlights that x_batched might change in the future. But we
-                # use _score_fn immediately inside the loop, so there are no risks.
+            if method == "torchsde":
+                # For torchsde, the "score_fn" is the entire score model module
+                score_fn_for_sdeint = self.score_model
+            else:
+                def _score_fn(y, t):
+                    return self.score_model.score(y=y, X=x_batched, t=t)  # noqa: B023
+                    # B023 highlights that x_batched might change in the future. But we
+                    # use _score_fn immediately inside the loop, so there are no risks.
+                score_fn_for_sdeint = score_fn
 
             y_batch_samples = sdeint(
                 self.sde,
@@ -382,9 +394,11 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
                 self.sde.T,
                 0,
                 n_steps=n_steps,
-                method="euler",
+                method=method,
                 seed=seed + n_samples_sampled if seed is not None else None,
-                score_fn=_score_fn,
+                score_fn=_score_fn_for_sdeint,
+                x_features=x_transformed,
+                seed=seed + n_samples_sampled if seed is not None else None,
             )
             n_samples_sampled += batch_size_samples
             y_samples.append(y_batch_samples)

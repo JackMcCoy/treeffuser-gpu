@@ -5,6 +5,7 @@ from typing import Literal
 from treeffuser._base_tabular_diffusion import BaseTabularDiffusion
 from treeffuser._score_models import LightGBMScoreModel
 from treeffuser._score_models import ScoreModel
+from ._torch_components import TorchMLPScoreModel, TorchVESDE, ReverseTorchSDE
 from treeffuser.sde import DiffusionSDE
 from treeffuser.sde import get_diffusion_sde
 
@@ -31,6 +32,8 @@ class Treeffuser(BaseTabularDiffusion):
         sde_hyperparam_max: float | Literal["default"] | None = None,
         seed: int | None = None,
         verbose: int = 0,
+        solver_type = 'lightgbm',
+        extra_torch_params: dict | None = None,
         extra_lightgbm_params: dict | None = None,
     ):
         """
@@ -81,6 +84,8 @@ class Treeffuser(BaseTabularDiffusion):
             Random seed for generating the training data and fitting the model.
         verbose : int
             Verbosity of the score model.
+        solver_type : str
+            Leave as 'lightgbm' for original method, or change to 'torchsde' for parallel GPU processing.
         """
         super().__init__(
             sde_initialize_from_data=sde_initialize_from_data,
@@ -105,6 +110,8 @@ class Treeffuser(BaseTabularDiffusion):
         self.sde_hyperparam_min = sde_hyperparam_min
         self.sde_hyperparam_max = sde_hyperparam_max
         self.extra_lightgbm_params = extra_lightgbm_params or {}
+        self.solver_type = solver_type
+        self.extra_torch_params = extra_torch_params or {}
 
     def get_new_sde(self) -> DiffusionSDE:
         sde_cls = get_diffusion_sde(self.sde_name)
@@ -117,24 +124,32 @@ class Treeffuser(BaseTabularDiffusion):
         return sde
 
     def get_new_score_model(self) -> ScoreModel:
-        score_model = LightGBMScoreModel(
-            n_repeats=self.n_repeats,
-            n_estimators=self.n_estimators,
-            eval_percent=self.eval_percent,
-            early_stopping_rounds=self.early_stopping_rounds,
-            num_leaves=self.num_leaves,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            max_bin=self.max_bin,
-            subsample_for_bin=self.subsample_for_bin,
-            min_child_samples=self.min_child_samples,
-            subsample=self.subsample,
-            subsample_freq=self.subsample_freq,
-            verbose=self.verbose,
-            seed=self.seed,
-            n_jobs=self.n_jobs,
-            **self.extra_lightgbm_params,
-        )
+        if self.solver_type == "torchsde": 
+            score_model = TorchMLPScoreModel(
+                n_repeats=self.n_repeats,
+                eval_percent=self.eval_percent,
+                seed=self.seed,
+                **self.extra_torch_params
+            )
+        else:
+            score_model = LightGBMScoreModel(
+                n_repeats=self.n_repeats,
+                n_estimators=self.n_estimators,
+                eval_percent=self.eval_percent,
+                early_stopping_rounds=self.early_stopping_rounds,
+                num_leaves=self.num_leaves,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                max_bin=self.max_bin,
+                subsample_for_bin=self.subsample_for_bin,
+                min_child_samples=self.min_child_samples,
+                subsample=self.subsample,
+                subsample_freq=self.subsample_freq,
+                verbose=self.verbose,
+                seed=self.seed,
+                n_jobs=self.n_jobs,
+                **self.extra_lightgbm_params,
+            )
         return score_model
 
     @property

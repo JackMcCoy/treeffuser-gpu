@@ -7,6 +7,7 @@ from numpy import ndarray
 
 from .base_sde import BaseSDE
 from .base_sde import ReverseSDE
+from .torch_solver import TorchSolver
 
 _AVAILABLE_SOLVERS = {}
 
