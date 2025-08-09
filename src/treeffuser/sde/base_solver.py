@@ -7,7 +7,6 @@ from numpy import ndarray
 
 from .base_sde import BaseSDE
 from .base_sde import ReverseSDE
-from .torch_solver import TorchSolver
 
 _AVAILABLE_SOLVERS = {}
 
@@ -20,6 +19,7 @@ def sdeint(
     method="euler",
     n_steps=20,
     score_fn=None,
+    x_features=None,
     n_samples=1,
     seed=None,
 ):

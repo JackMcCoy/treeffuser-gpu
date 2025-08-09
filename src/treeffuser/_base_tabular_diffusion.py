@@ -4,6 +4,8 @@ import abc
 import warnings
 from typing import Literal
 
+import torch
+import torchsde
 import einops
 import numpy as np
 import pandas as pd
@@ -16,6 +18,7 @@ from tqdm import tqdm
 from treeffuser._scaler import ScalerMixedTypes
 from treeffuser._score_models import ScoreModel
 from treeffuser._warnings import ConvergenceWarning
+from ._torch_components import TorchVESDE, ReverseTorchSDE as ReverseTorchModule, TorchMLPScoreModel
 from treeffuser.sde import DiffusionSDE
 from treeffuser.sde import sdeint
 
@@ -354,55 +357,69 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
         n_steps: int = 100,
         seed=None,
         verbose: bool = False,
-        method: str = "euler"
+        method: str = "euler",
     ) -> Float[ndarray, "n_samples batch y_dim"]:
-        """
-        Sampling method that preserves shape conventions.
-        """
+        """Sampling method that preserves shape conventions."""
         x_transformed = self._x_scaler.transform(X)
         batch_size_x = x_transformed.shape[0]
         y_dim = self._y_dim
 
-        n_samples_sampled = 0
         y_samples = []
-        x_batched = None
-
+        n_samples_sampled = 0
         pbar = tqdm(total=n_samples, disable=not verbose)
-        while n_samples_sampled < n_samples:
-            batch_size_samples = min(n_parallel, n_samples - n_samples_sampled)
-            y_batch = self.sde.sample_from_theoretical_prior(
-                (batch_size_samples * batch_size_x, y_dim),
-                seed=seed,
-            )
-            if x_batched is None or x_batched.shape[0] != batch_size_samples:
-                # Reuse the same batch of x as much as possible
+
+        if method == "torchsde":
+            if not isinstance(self.score_model, TorchMLPScoreModel):
+                raise ValueError(
+                    "To use method='torchsde' for sampling, the model must be initialized "
+                    "with backend='torch'. The current backend is likely 'lightgbm'."
+                )
+            
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if seed is not None:
+                torch.manual_seed(seed)
+
+            torch_sde = TorchVESDE(self.sde.hyperparam_schedule).to(device)
+            score_model = self.score_model.to(device)
+            x_torch = torch.from_numpy(x_transformed).float().to(device)
+            
+            while n_samples_sampled < n_samples:
+                batch_size_samples = min(n_parallel, n_samples - n_samples_sampled)
+                y0_shape = (batch_size_samples * batch_size_x, y_dim)
+                
+                x_torch_tiled = x_torch.repeat(batch_size_samples, 1)
+                reverse_sde_module = ReverseTorchModule(torch_sde, score_model, x_torch_tiled, T=self.sde.T)
+                
+                y0_torch = torch.from_numpy(self.sde.sample_from_theoretical_prior(y0_shape, seed=seed)).float().to(device)
+                ts = torch.tensor([0., self.sde.T], device=device)
+                
+                solution = torchsde.sdeint(reverse_sde_module, y0_torch, ts, dt=1./n_steps, method='euler')
+                y_batch_samples = solution[-1].detach().cpu().numpy()
+                
+                y_samples.append(y_batch_samples)
+                n_samples_sampled += batch_size_samples
+                pbar.update(batch_size_samples)
+
+        # Use the original NumPy backend
+        else:
+            while n_samples_sampled < n_samples:
+                batch_size_samples = min(n_parallel, n_samples - n_samples_sampled)
+                y0_shape = (batch_size_samples * batch_size_x, y_dim)
+                y_batch = self.sde.sample_from_theoretical_prior(y0_shape, seed=seed)
+                
                 x_batched = np.tile(x_transformed, [batch_size_samples, 1])
+                def score_fn(y, t):
+                    return self.score_model.score(y=y, X=x_batched, t=t)
 
-            if method == "torchsde":
-                # For torchsde, the "score_fn" is the entire score model module
-                score_fn_for_sdeint = self.score_model
-            else:
-                def _score_fn(y, t):
-                    return self.score_model.score(y=y, X=x_batched, t=t)  # noqa: B023
-                    # B023 highlights that x_batched might change in the future. But we
-                    # use _score_fn immediately inside the loop, so there are no risks.
-                score_fn_for_sdeint = score_fn
-
-            y_batch_samples = sdeint(
-                self.sde,
-                y_batch,
-                self.sde.T,
-                0,
-                n_steps=n_steps,
-                method=method,
-                seed=seed + n_samples_sampled if seed is not None else None,
-                score_fn=_score_fn_for_sdeint,
-                x_features=x_transformed,
-                seed=seed + n_samples_sampled if seed is not None else None,
-            )
-            n_samples_sampled += batch_size_samples
-            y_samples.append(y_batch_samples)
-            pbar.update(batch_size_samples)
+                y_batch_samples = sdeint(
+                    self.sde, y_batch, self.sde.T, 0,
+                    n_steps=n_steps, method=method, score_fn=score_fn,
+                    seed=seed + n_samples_sampled if seed is not None else None,
+                )
+                y_samples.append(y_batch_samples)
+                n_samples_sampled += batch_size_samples
+                pbar.update(batch_size_samples)
+        
         pbar.close()
 
         y_transformed = np.concatenate(y_samples, axis=0)
@@ -413,7 +430,7 @@ class BaseTabularDiffusion(BaseEstimator, abc.ABC):
             "(n_samples batch) y_dim -> n_samples batch y_dim",
             n_samples=n_samples,
         )
-        return y_untransformed
+        return y_untransformed 
 
     def predict(
         self,

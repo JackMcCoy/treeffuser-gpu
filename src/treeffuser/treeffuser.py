@@ -5,7 +5,7 @@ from typing import Literal
 from treeffuser._base_tabular_diffusion import BaseTabularDiffusion
 from treeffuser._score_models import LightGBMScoreModel
 from treeffuser._score_models import ScoreModel
-from ._torch_components import TorchMLPScoreModel, TorchVESDE, ReverseTorchSDE
+from ._torch_components import TorchMLPScoreModel
 from treeffuser.sde import DiffusionSDE
 from treeffuser.sde import get_diffusion_sde
 
@@ -32,7 +32,7 @@ class Treeffuser(BaseTabularDiffusion):
         sde_hyperparam_max: float | Literal["default"] | None = None,
         seed: int | None = None,
         verbose: int = 0,
-        solver_type = 'lightgbm',
+        backend: str = 'lightgbm',
         extra_torch_params: dict | None = None,
         extra_lightgbm_params: dict | None = None,
     ):
@@ -84,7 +84,7 @@ class Treeffuser(BaseTabularDiffusion):
             Random seed for generating the training data and fitting the model.
         verbose : int
             Verbosity of the score model.
-        solver_type : str
+        backend : str
             Leave as 'lightgbm' for original method, or change to 'torchsde' for parallel GPU processing.
         """
         super().__init__(
@@ -110,7 +110,7 @@ class Treeffuser(BaseTabularDiffusion):
         self.sde_hyperparam_min = sde_hyperparam_min
         self.sde_hyperparam_max = sde_hyperparam_max
         self.extra_lightgbm_params = extra_lightgbm_params or {}
-        self.solver_type = solver_type
+        self.backend = backend
         self.extra_torch_params = extra_torch_params or {}
 
     def get_new_sde(self) -> DiffusionSDE:
@@ -124,11 +124,12 @@ class Treeffuser(BaseTabularDiffusion):
         return sde
 
     def get_new_score_model(self) -> ScoreModel:
-        if self.solver_type == "torchsde": 
+        if self.backend == "torchsde": 
             score_model = TorchMLPScoreModel(
                 n_repeats=self.n_repeats,
                 eval_percent=self.eval_percent,
                 seed=self.seed,
+                early_stopping_rounds=self.early_stopping_rounds,
                 **self.extra_torch_params
             )
         else:
