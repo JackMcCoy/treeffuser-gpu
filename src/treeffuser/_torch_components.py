@@ -21,6 +21,29 @@ def get_torch_device():
     else:
         return 'cpu'
 
+class ResidualBlock(nn.Module):
+    """
+    A simple residual block with two linear layers.
+    """
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        
+        self.linear1 = nn.Linear(input_dim, output_dim)
+        self.linear2 = nn.Linear(output_dim, output_dim)
+        
+        self.activation = nn.SiLU() # SiLU (Swish) is a common and effective choice
+        
+        if input_dim != output_dim:
+            self.residual_connection = nn.Linear(input_dim, output_dim)
+        else:
+            self.residual_connection = nn.Identity()
+
+    def forward(self, x):
+        h = self.activation(self.linear1(x))
+        h = self.linear2(h) 
+        
+        return h + self.residual_connection(x)
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -44,38 +67,27 @@ class MLP(nn.Module):
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(time_emb_dim),
             nn.Linear(time_emb_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
         )
-
-        # Initial projection of data features
-        self.initial_proj = nn.Linear(input_dim, hidden_dim)
-        self.initial_activation = nn.SiLU()
-
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-
-        # Main network layers
-        layers = []
-        for _ in range(n_layers - 1):
-            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
-        final_layer = nn.Linear(hidden_dim, output_dim)
-        torch.nn.init.zeros_(final_layer.weight)
-        torch.nn.init.zeros_(final_layer.bias)
-        layers.append(final_layer)
-        self.network = nn.Sequential(*layers)
+        self.initial_proj = nn.Linear(input_dim + hidden_dim, hidden_dim)        
+        self.blocks = nn.ModuleList()
+        current_dim = hidden_dim
+        for dim in range(n_layers):
+            self.blocks.append(ResidualBlock(
+                input_dim=hidden_dim, 
+                output_dim=hidden_dim
+            ))
+        self.final_proj = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x, t):
-        # x is the concatenation of (y_perturbed, x_features)
-        # t is the time tensor
         t_emb = self.time_mlp(t.squeeze(-1))
-        x_proj = self.initial_proj(x)
+        h = self.initial_proj(torch.cat([x, t_emb], dim=1))
         
-        h = x_proj + t_emb  # Add the time embedding to the data representation
-        
-        h = self.initial_activation(h)
-        h = self.layer_norm(h)
-
-        return self.network(h)
+        for block in self.blocks:
+            x_with_time = h+t_emb
+            h = block(x_with_time)
+            
+        return self.final_proj(h)
 
 class TorchMLPScoreModel(ScoreModel, nn.Module):
     """
@@ -123,9 +135,13 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
             )
             val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=self.batch_size, shuffle=False)
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr)
         criterion = nn.MSELoss()
-        scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
+                                                    max_lr=self.lr,
+                                                    total_steps=self.epochs * (len(X) // self.batch_size),
+                                                    pct_start=0.03, # Use 10% of steps for warmup
+                                                    anneal_strategy='cos')
 
         best_val_loss = float('inf')
         epochs_no_improve = 0
@@ -149,7 +165,6 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
                 loss = criterion(output, targets)
                 loss.backward()
                 optimizer.step()
-                print(loss.item())
                 pbar.set_postfix({"loss": loss.item()})
 
             if val_loader and self.early_stopping_rounds:
@@ -175,6 +190,7 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
                     epochs_no_improve += 1
                 
                 if epochs_no_improve >= self.early_stopping_rounds:
+                    print(loss.item())
                     print(f"Early stopping at epoch {epoch + 1}")
                     early_stopped = True
                     break

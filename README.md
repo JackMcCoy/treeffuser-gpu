@@ -9,6 +9,8 @@
 [![Documentation](https://img.shields.io/badge/docs-passing-green)](https://blei-lab.github.io/treeffuser/docs/getting-started.html)
 [![arXiv](https://img.shields.io/badge/arXiv-2406.07658-red)](https://arxiv.org/abs/2406.07658)
 
+## Note: This repo is mostly AI slop and experimentation. The neural network is a meaningful departure from the tree-based scoring, but I can't make the repo private... The torch version also doesn't seem to be faster.
+
 Treeffuser is an easy-to-use package for **probabilistic prediction on tabular data with tree-based diffusion models**.
 It estimates distributions of the form `p(y|x)` where `x` is a feature vector and `y` is a target vector.
 Treeffuser can model conditional distributions `p(y|x)` that are arbitrarily complex (e.g., multimodal, heteroscedastic, non-Gaussian, heavy-tailed, etc.).
