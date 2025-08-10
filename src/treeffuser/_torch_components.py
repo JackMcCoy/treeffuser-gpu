@@ -3,10 +3,12 @@ from torch import nn
 import numpy as np
 from tqdm import tqdm
 import copy
+import math
 
 from ._base_score_model import ScoreModel
 from ._training_utils import _make_training_data
 from treeffuser.sde import DiffusionSDE
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 def get_torch_device():
     """
@@ -19,21 +21,61 @@ def get_torch_device():
     else:
         return 'cpu'
 
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
 # A simple MLP to be used as the score network
 class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=256, n_layers=4):
+    def __init__(self, input_dim, output_dim, hidden_dim=256, n_layers=4, time_emb_dim=32):
         super().__init__()
-        layers = [nn.Linear(input_dim, hidden_dim), nn.SiLU()]
-        for _ in range(n_layers - 2):
+        
+        # Time embedding projection
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(time_emb_dim),
+            nn.Linear(time_emb_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Initial projection of data features
+        self.initial_proj = nn.Linear(input_dim, hidden_dim)
+        self.initial_activation = nn.SiLU()
+
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # Main network layers
+        layers = []
+        for _ in range(n_layers - 1):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
-        layers.append(nn.Linear(hidden_dim, output_dim))
+        final_layer = nn.Linear(hidden_dim, output_dim)
+        torch.nn.init.zeros_(final_layer.weight)
+        torch.nn.init.zeros_(final_layer.bias)
+        layers.append(final_layer)
         self.network = nn.Sequential(*layers)
 
     def forward(self, x, t):
-        # Concatenate time embedding to input
-        t_emb = t.expand(x.shape[0], -1)
-        inp = torch.cat([x, t_emb], dim=1)
-        return self.network(inp)
+        # x is the concatenation of (y_perturbed, x_features)
+        # t is the time tensor
+        t_emb = self.time_mlp(t.squeeze(-1))
+        x_proj = self.initial_proj(x)
+        
+        h = x_proj + t_emb  # Add the time embedding to the data representation
+        
+        h = self.initial_activation(h)
+        h = self.layer_norm(h)
+
+        return self.network(h)
 
 class TorchMLPScoreModel(ScoreModel, nn.Module):
     """
@@ -59,7 +101,7 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
         y_dim = y.shape[1]
         x_dim = X.shape[1]
         
-        input_dim = y_dim + x_dim + 1
+        input_dim = y_dim + x_dim
         self.model = MLP(input_dim, y_dim).to(self.device)
         
         lgb_X_train, lgb_X_val, lgb_y_train, lgb_y_val, _ = _make_training_data(
@@ -83,10 +125,12 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         criterion = nn.MSELoss()
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs)
 
         best_val_loss = float('inf')
         epochs_no_improve = 0
         best_model_state = None
+        early_stopped = False
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -105,6 +149,7 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
                 loss = criterion(output, targets)
                 loss.backward()
                 optimizer.step()
+                print(loss.item())
                 pbar.set_postfix({"loss": loss.item()})
 
             if val_loader and self.early_stopping_rounds:
@@ -131,33 +176,40 @@ class TorchMLPScoreModel(ScoreModel, nn.Module):
                 
                 if epochs_no_improve >= self.early_stopping_rounds:
                     print(f"Early stopping at epoch {epoch + 1}")
+                    early_stopped = True
                     break
+
+            scheduler.step()
         
-        if best_model_state:
+        if early_stopped and best_model_state:
             self.model.load_state_dict(best_model_state)
         
         return self
 
     def score(self, y, X, t):
+        # y, X, and t are expected to be torch.Tensors on the correct device
         if self.model is None:
             raise ValueError("The model has not been fitted yet.")
         
-        # y, X, and t are expected to be torch.Tensors on the correct device
-        model_input = torch.cat([y, X], dim=1)
-        score_p = self.model(model_input, t)
-        
-        # Convert tensors to numpy for the numpy-based SDE methods
-        y_np = y.detach().cpu().numpy()
-        t_np = t.detach().cpu().numpy()
-        
-        _, std_np = self.sde.get_mean_std_pt_given_y0(y_np, t_np)
-        std = torch.from_numpy(std_np.copy()).float().to(y.device)
+        self.model.eval()
+        with torch.no_grad():
+            t_clamped = torch.clamp(t, min=1e-5)
+            model_input = torch.cat([y, X], dim=1)
+            score_p = self.model(model_input, t_clamped)
+            
+            alpha_t = self.sde.hyperparam_schedule.min_value * \
+                      (self.sde.hyperparam_schedule.max_value / self.sde.hyperparam_schedule.min_value) ** t_clamped
+            alpha_0 = torch.full_like(alpha_t, self.sde.hyperparam_schedule.min_value)
 
-        if std.shape != score_p.shape:
-             std = std.expand_as(score_p)
+            std = (alpha_t**2 - alpha_0**2).sqrt()
 
-        score = score_p / std
-        return score
+            if std.shape != score_p.shape:
+                 std = std.expand_as(score_p)
+
+            # Safeguard against division by zero
+            score = score_p / torch.clamp(std, min=1e-5)
+            
+        return score.detach().cpu().numpy()
 
 class TorchVESDE(nn.Module):
     sde_type = 'ito'
@@ -190,7 +242,7 @@ class ReverseTorchSDE(nn.Module):
         self.score_model = score_model
         self.x_features = x_features 
         self.T = T
-        self.g = self.forward_sde.g
+        #self.g = self.forward_sde.g
 
     def f(self, t, y): # Reverse Drift
         reverse_time = self.T - t
@@ -206,3 +258,7 @@ class ReverseTorchSDE(nn.Module):
         diffusion_term = (diffusion**2).squeeze(-1)
         
         return -forward_drift + diffusion_term * score
+
+    def g(self, t, y):
+        reverse_time = self.T - t
+        return self.forward_sde.g(reverse_time, y)
